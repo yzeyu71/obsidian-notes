@@ -1,4 +1,4 @@
-[[issue_qwen3_4b_ascend_container_validation]]
+[issue_qwen3_4b_ascend_container_validation](issue_qwen3_4b_ascend_container_validation.md)
 
 拉起 vime docker
 ```bash
@@ -24,7 +24,7 @@ docker run -d --name vime-npu -it --net=host --shm-size=1024g \
 docker exec -it vime-npu bash
 
 ```
-![[Pasted image 20260609195401.png|697]]
+![697](../assets/Pasted%20image%2020260609195401.png)
 
 下载模型权重
 hf download Qwen/Qwen3-4B --local-dir /path/to/Qwen/Qwen3-4B
@@ -34,5 +34,5 @@ hf download Qwen/Qwen3-4B --local-dir /path/to/Qwen/Qwen3-4B
 _
 cd /root/vime
 bash test_qwen3_4B.sh
-![[ffbbf131558b569039c2a4b193e9a6d5.png|697]]
+![697](../assets/ffbbf131558b569039c2a4b193e9a6d5.png)
 
