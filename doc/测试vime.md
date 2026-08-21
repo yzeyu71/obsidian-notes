@@ -1,4 +1,4 @@
-[issue_qwen3_4b_ascend_container_validation](issue_qwen3_4b_ascend_container_validation.md)
+[issue_qwen3_4b_ascend_container_validation](../assets/issue_qwen3_4b_ascend_container_validation.md)
 
 拉起 vime docker
 ```bash
