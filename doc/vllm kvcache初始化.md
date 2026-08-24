@@ -52,7 +52,7 @@ vLLM 把 KV Cache 切成固定大小的 **block**（类似操作系统的内存�
 
 ### 4. 与本文的关系
 
-本文描述 vLLM V1（`use_v2_model_runner=True`，即 `vllm/v1/worker/gpu/model_runner.py`）中 KV Cache 的完整生命周期：
+本文描述 vLLM（`use_v2_model_runner=True`，即 `vllm/v1/worker/gpu/model_runner.py`）中 KV Cache 的完整生命周期：
 
 1. **初始化**：探测显存 → 生成每个 rank 的 `KVCacheConfig` → 下发到 worker → 分配并绑定物理 KV tensor（本文一～六章）。
 2. **运行时管理**：调度阶段做 prefix 命中、分配/回收 block、零化与 copy-on-write（本文第九章）。
@@ -60,6 +60,9 @@ vLLM 把 KV Cache 切成固定大小的 **block**（类似操作系统的内存�
 理解 KV Cache 的上述作用后，再读后面的初始化和调度代码会更清楚每步在解决什么问题。
 
 ## 一、整体调用链
+
+![](../assets/Pasted%20image%2020260824195538.png)
+
 
 ```text
 EngineCore._initialize_kv_caches()
@@ -82,9 +85,9 @@ EngineCore._initialize_kv_caches()
             `-- collective_rpc("compile_or_warm_up_model")
 ```
 
-入口位于 `vllm/v1/engine/core.py` 的 `EngineCore._initialize_kv_caches()`。它负责规划 KV cache，而不是直接在 engine-core 进程中分配 GPU tensor。
+入口位于 `vllm/v1/engine/core.py` 的 `EngineCore._initialize_kv_caches()`。它负责规划 KV cache
 
-## 二、EngineCore：规划 KV Cache（细化）
+## 二、EngineCore：规划 KV Cache
 
 入口 `EngineCore._initialize_kv_caches()`（`vllm/v1/engine/core.py`）的真实实现如下，每一步在下方展开：
 
