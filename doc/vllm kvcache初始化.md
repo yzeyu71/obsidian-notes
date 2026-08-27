@@ -298,6 +298,8 @@ def determine_available_memory(self) -> int:
 
 ### 3.5 生成每 rank 配置：`get_kv_cache_configs`
 
+> 定位：`get_kv_cache_configs` 是"规划"阶段的核心方法——吃进 3.2 收集的各 worker spec 和 3.4 探测的可用显存，吐出每个 rank 的 `KVCacheConfig`。它要同时解决两个矛盾：**PP 下各 worker 层不同**（需"全局规划、按 worker 投影"）与**各 rank 显存不同**（需"收敛到一致的 block 数"）。
+
 `vllm/v1/core/kv_cache_utils.py:2082` 的真实流程：
 
 ```python
@@ -351,6 +353,34 @@ def get_kv_cache_configs(vllm_config, kv_cache_specs, available_memory):
 
     return kv_cache_configs
 ```
+
+**逐步拆解（每一步的"为什么"比代码本身更重要）：**
+
+- **(a) 合并 spec —— 建立"整模型视角"**。PP 下每个 worker 只拥有部分层（stage0 有 0-15 层、stage1 有 16-31 层），各自上报的 spec 只是全局的子集；TP 下同 stage 的各 rank 层相同。这里把散落的 spec 合并成一份"全模型层 → spec"映射。如果同一层在不同 worker 上报了不同 spec，直接 assert 失败——同层类型必须一致，这是跨 rank 一致性的第一道防线。
+- **(b) 校验注册 —— 防止"运行时找不到 manager"**。`check_kv_cache_spec_registry` 逐个确认 spec 类都在 `register_all_kvcache_specs` 里注册过。注册表是 spec → manager 的映射，漏注册会在分组 / 调度阶段才爆雷，提前到启动期报错更友好。
+- **(c) MTP 标记 —— 给滑动窗口"留尾巴"**。使用多模块 MTP（多个 speculative module）时，给每个 `SlidingWindowSpec` 打上 `extra_retained_tokens = num_speculative_tokens - 1`。原因：sliding window 只保留最近窗口的 token，而 MTP 的 store 侧比主模型延迟一拍，若窗口边界正好卡在 MTP 需要的 token 上，缓存里就重建不出窗口，所以要额外保留这些 token。
+- **(d) 全局分组 —— 见 3.5.1**。`get_kv_cache_groups` 把"整模型"的层按 attention 类型分成若干个 group（full / sliding window / mamba / cross-attention…）。注意它可能**原地修改** `merged_kv_cache_specs`（例如强制统一混合类型的 page size）。
+- **(e) 按 PP 投影 —— 每个 worker 只看自己的层**。`_project_kv_cache_groups_to_worker` 把全局 group 过滤成只含本 worker 层的子集（`UniformTypeKVCacheSpecs` 里的 per-layer spec 也同步裁剪）。这一步之后，"显存能支撑多少 block"就只和该 worker 自己拥有的层相关。
+- **(f) override 换算 —— 用户指定块数时重新校准**。若设置了 `--num-gpu-blocks-override`，实际分配块数与 profiling 出的 `available_memory` 解耦。这里用 `_pool_bytes_per_block` 把 override 换算回 "effective memory"（override × 每 block 字节），让后面的 auto-fit、显存检查、per-worker 配置都基于**同一个有效容量**规划，避免三处对不上。
+- **(g) auto-fit max_model_len —— 二分搜索最大可支持上下文**。当用户没指定 `max_model_len`（`original_max_model_len == -1`）时，估算现有显存能装下的最长上下文，取**所有 worker 中能支撑的最小值**（最弱一环），必要时原地改写 `model_config.max_model_len`。这正是 EngineCore 之后比较 `max_model_len_before/after` 并调 `update_max_model_len` 把新值同步给 worker 的原因。
+- **(h) 显存足够性检查 —— 启动期就"报错不隔夜"**。逐 worker 计算在 max_model_len 下"至少服务一个请求"需要多少 KV 显存（`_max_memory_usage_bytes_from_groups`），与可用显存比较。不足则直接抛错，并给出"估算最大长度""建议提高 `gpu_memory_utilization` 或降低 `max_model_len`"等可操作提示。
+- **(i) 逐 worker 生成配置 —— 见 3.5.2**。每个 worker 用自己的 projected groups + available_memory 调 `get_kv_cache_config_from_groups`，得到各自的 `num_blocks` 与 `kv_cache_tensors`。
+- **(j) 收敛到最小 num_blocks —— 多 rank 一致性**。各 rank 显存可能不均衡（物理卡容量不同），但调度器要求**所有 rank 的 block 数完全一致**。于是取全局最小值，并让每个 rank 的 tensor 按 `min / old` 比例缩小，避免多分配的显存闲置。
+
+> **一个具体例子（PP=2、TP=2、纯 full attention 模型）**
+>
+> ```text
+> worker0（stage0，层 0-15）可用显存 20 GiB
+> worker1（stage1，层 16-31）可用显存 16 GiB
+>
+> (a) 合并 → 32 层 full-attention spec
+> (d) 全局分组 → 1 个 group（32 层）
+> (e) 投影 → worker0 的 group = 层 0-15；worker1 的 group = 层 16-31
+> (i) 各自算块数（假设每 block 1 MiB）→ worker0: 20480，worker1: 16384
+> (j) 取最小 → 两个 worker 都是 16384，worker0 的 tensor 按 16384/20480 缩小
+>
+> 结果：所有 rank 一致地拥有 16384 个逻辑 block，调度器无需关心 rank 差异。
+> ```
 
 关键点：合并 spec → 分组 → 按 PP 投影 → auto-fit / 校验 → 每 rank 独立建配置 → 收敛到最小 `num_blocks`，保证所有 worker 一致。
 
@@ -471,7 +501,7 @@ def resolve_kv_cache_block_sizes(kv_cache_config, vllm_config):
 
 ### 4.1 Executor 入口
 
-当前方法名是 `initialize_from_config`，不是 `initialize`：
+当前方法名是 `initialize_from_config`：
 
 ```python
 # vllm/v1/executor/abstract.py
@@ -740,73 +770,12 @@ if self.use_v2_model_runner:
 
 这是 V2 与 V1 最大的不同：它**手工构造真实调度器形状的 SchedulerOutput**（一次 N 请求 prefill → 多个 decode step → 清理），再走 `worker.execute_model` + `sample_tokens`，把 sampler、grammar bitmask、零化等**不在 cudagraph 里的 Triton kernel 全部 JIT 编译一遍**，同时 `kv_block_zeroer.warmup()` 预热零化 kernel。V1 在同样位置只做 sampler / pooler 的 dummy run。
 
-### 6.4 四个容易绕晕的点
-
-1. **"方法定义在 GPUWorker 而不是 V2 runner"**：`compile_or_warm_up_model` 属于 worker 的对外接口，它负责**编排**——调用 runner 的 `_dummy_run`、`capture_model`、`warmup_kernels`；runner 只提供能力。RPC 名 `"compile_or_warm_up_model"` 对应的是 worker 上的这个方法，不是 runner 的方法。
-2. **为什么必须在 KV cache 分配之后**：dummy run 是真实 forward，会**真的读写刚分配好的 KV cache**（block table、零化、attention 都要真实形状）；CUDA Graph 捕获更要录制完整执行流。KV cache 没分配，这一步根本跑不起来，而且捕获时的内存布局必须与运行时一致。
-3. **"受 compilation mode、cudagraph mode、capture sizes、speculative decoding、multimodal 影响"**：意思是**这几个配置决定"哪几条路径会被热身"**——mode=NONE 跳过阶段 1；cudagraph=NONE（如 enforce-eager）跳过阶段 3；有 spec decode 则连带 warmup drafter；multimodal 则 capture 时还要录 encoder 图。
-4. **"V2 不能直接套用 V1 的 `_dummy_run(size)` 说明"**：V1、V2 都有 `_dummy_run`，但 **V2 额外有 `warmup_kernels`，走的是真实调度路径**。讲解时应以 V2 的 `warmup_kernels` 为重点，而不是把 V1 的 `_dummy_run` 实现细节搬过来。
 
 > **核心要点**：四阶段的顺序是——**先 shape 编译，再 kernel 调优，再录 CUDA Graph，最后补漏 Triton kernel**。每一步都是让"运行时必然发生的首次编译"提前到服务开始之前。
 
 ---
 
-## 七、运行时的新 block 清零
-
-> 这一节经常让人困惑：清零明明是"运行时"的事，为什么放在初始化章节？答案在 7.2 和 7.3——**"能力准备"在初始化，"执行"在运行时**，文档按初始化调用链组织，所以两件事在这一章一起讲。
-
-### 7.1 为什么需要清零：block 是回收复用的
-
-KV Cache 是会被**复用**的：请求结束释放的 block，可能被下一个请求拿到。如果不清零，新请求会读到上一个请求残留的脏数据，污染 attention / SSM 计算。
-
-但注意一个容易误解的点：**并非所有模型都需要零化**。`KVCacheConfig.needs_kv_cache_zeroing`（`kv_cache_interface.py:997`）只有在两种情况下才为 True：
-
-```python
-return self.has_mamba_layers or self.has_mixed_precision_kv_cache
-```
-
-- **有 Mamba 层**：Mamba 是循环状态机，状态在"读"的时候可能还没被"写"完，残留旧值会直接污染计算（见 #35219）；
-- **混合精度 KV cache**：一个 block 在不同 group 间复用，字节被"换一种精度"重新解释，旧数据可能被解码成 NaN / Inf。
-
-而最常见的**单一精度 full-attention 模型（Llama / Qwen 等）完全跳过零化**——因为 full attention 里，block 还没写到的位置**永远不会被读到**（attention mask 保证），残留脏数据无害。这也是为什么整套机制是"按需启用"的。
-
-### 7.2 为什么"能力准备"在初始化阶段
-
-`GPUWorker.initialize_from_config` 在 CuMem 池外调用 V2 runner 的 `_init_kv_zero_meta()`（`gpu/model_runner.py:621`），创建 `KVBlockZeroer` 并保存为 `self.kv_block_zeroer`。这一步**必须在初始化做**，因为它需要：
-
-- **已分配好的物理 KV tensor**：用来计算每个 block 段的绝对内存地址（`seg_addrs`）；
-- **block size / cache_dtype / kernel block size / attention groups**：这些只有 KV cache 分配完之后才知道。
-
-`KVBlockZeroer.__init__`（`vllm/v1/worker/utils.py:100`）会**预计算一张"地址表"**——每个 block id 对应它在显存里的绝对字节地址。这样运行时每步的零化只是一个按 block id 寻址的廉价 Triton kernel 发射，没有 Python 层遍历。warmup 阶段（`gpu/warmup.py:292`）还会调用 `kv_block_zeroer.warmup(num_blocks)` 先把零化 kernel JIT 编译好。
-
-### 7.3 为什么"执行"在运行时
-
-零化的**触发条件只有调度器每步才知道**：哪些 block 刚被分给新请求。所以流程分两步：
-
-1. **scheduler 侧**：每个 step 结束时 `take_new_block_ids()` 收集本轮新分配的 block id，写入 `SchedulerOutput.new_block_ids_to_zero` 下发（仅当 `needs_kv_cache_zeroing` 时才会记录这些 id）；
-2. **worker 侧**：V2 runner 在 `update_requests()`（`gpu/model_runner.py:1036`）里、**forward 之前**消费：
-
-```python
-if scheduler_output.new_block_ids_to_zero:
-    assert self.kv_block_zeroer is not None
-    self.kv_block_zeroer.zero_block_ids(scheduler_output.new_block_ids_to_zero)
-```
-
-`zero_block_ids` 用预计算的地址表 + Triton kernel 把对应 block 清零。
-
-### 7.4 为什么不干脆在初始化时清零一次
-
-三个理由，层层递进：
-
-1. **清零了也白清**：block 是"回收再利用"的，脏数据来自"上一个主人"，是运行时才产生的——初始化时清零一次，服务过程中照样会变脏；
-2. **一次性清零整池太贵**：KV cache 动辄几十 GB，启动阶段清零纯属浪费时间；
-3. **按需清零又快又准**：只在"新 block 将被读到脏数据"的那一刻清它，而且 kernel 是按 block id 直接寻址的，每步开销极小。
-
-> **核心要点**：把这一章放在初始化叙事里的原因——**初始化阶段装好"机器"（`KVBlockZeroer` 的地址表 + kernel），运行时每个 step 用"机器"（按调度器下发的 block id 清零）**。前者是第七章（初始化链路的一步），后者在 9.5 节（运行时管理）。
-
----
-
-## 八、Scheduler 衔接：逻辑管理与物理 tensor 的分工
+## 七、Scheduler 衔接：逻辑管理与物理 tensor 的分工
 
 到这里，初始化完成。但 KV Cache 的管理才刚刚开始——初始化产出的配置，要交给调度器去用。
 
@@ -845,11 +814,11 @@ vllm/v1/engine/core.py
 
 ---
 
-## 九、初始化之后：KV Cache 的运行时管理
+## 八、初始化之后：KV Cache 的运行时管理
 
 初始化完成后，存在两套协同状态：**engine-core 侧的逻辑管理**（scheduler + `KVCacheManager`）和 **worker 侧的物理 KV tensor**。运行时每个 step 都在两者之间往返 block id 与零化/拷贝指令。
 
-### 9.1 管理器构建：`KVCacheManager` 与 coordinator
+### 8.1 管理器构建：`KVCacheManager` 与 coordinator
 
 Scheduler 在 `__init__`（`vllm/v1/core/sched/scheduler.py:277`）中用 scheduler 视角的 `KVCacheConfig` 构建管理器：
 
@@ -904,7 +873,7 @@ KVCacheManager（调度协调层）
 > 讲解提示：三层结构各司其职——
 > `KVCacheManager`（对外统一入口）→ `KVCacheCoordinator`（按场景选策略）→ 每 group 一个 `SingleTypeKVCacheManager`（干具体活）+ 共享的 `BlockPool`（管物理 block 的分配、引用计数、哈希索引）。之前注册表里的"spec → manager"映射，在这里真正生效。
 
-### 9.2 单类型管理器：`SingleTypeKVCacheManager` 基类
+### 8.2 单类型管理器：`SingleTypeKVCacheManager` 基类
 
 `vllm/v1/core/single_type_kv_cache_manager.py:36` 维护每个请求的 block 列表与缓存进度：
 
@@ -941,7 +910,7 @@ def free(self, request_id):
     self.block_pool.free_blocks(reversed(self.pop_blocks_for_free(request_id)))
 ```
 
-### 9.3 调度阶段：前缀命中与 block 分配
+### 8.3 调度阶段：前缀命中与 block 分配
 
 Scheduler 每步在 `_schedule_request` 里先做 prefix 命中，再分配（`scheduler.py:448/629`）：
 
@@ -993,7 +962,7 @@ self.coordinator.cache_blocks(request, ...)
 
 其中 `add_local_computed_blocks` 在启用缓存时调用 `block_pool.touch(blocks)` 增加引用计数；滑动窗口还会用 `null_block` 填充已 skip 的位置。
 
-### 9.4 回收与驱逐：free 与 deferred free
+### 8.4 回收与驱逐：free 与 deferred free
 
 请求结束（`FINISHED_STOPPED` / `FINISHED_ABORTED`）后，scheduler 走 `_free_request_blocks`（`scheduler.py:2429`）：
 
@@ -1021,7 +990,7 @@ def _drain_deferred_frees(self):
 
 `BlockPool.free_blocks` 递减引用计数；`ref_cnt == 0` 的 block 回到自由队列，可被后续请求复用（复用前 worker 会零化）。
 
-### 9.5 零化与 Copy-on-Write 的下发
+### 8.5 零化与 Copy-on-Write 的下发
 
 Scheduler 在 `schedule()` 结束前取出本轮新 block 与 CoW 对，写入 `SchedulerOutput`（`scheduler.py:1244/1325`）：
 
@@ -1051,7 +1020,7 @@ def update_requests(self, scheduler_output):
             scheduler_output.kv_cache_block_copies)
 ```
 
-### 9.6 运行时全链路小结
+### 8.6 运行时全链路小结
 
 ```text
 每个 step：
@@ -1079,7 +1048,7 @@ def update_requests(self, scheduler_output):
 
 ---
 
-## 十、回顾与延伸
+## 九、回顾与延伸
 
 ### 10.1 一图流回顾
 
