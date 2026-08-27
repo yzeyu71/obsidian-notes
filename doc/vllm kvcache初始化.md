@@ -1,29 +1,34 @@
 # vLLM V1 ModelRunner V2 的 KV Cache 初始化
 
-本文只描述 `use_v2_model_runner=True` 时的执行路径。此时 GPU worker 使用：
+> 本文基于 **v0.28.0** 源码，以「分享讲解」的形式完整走读 KV Cache 的初始化链路。
+> 适合听众：已经会用 vLLM 跑过模型、想理解内部机制、准备读源码或做二次开发的同学。
 
-```text
-vllm/v1/worker/gpu/model_runner.py
-```
+## 导读：这篇文章讲什么
 
-不要与 V1 runner 的以下路径混淆：
+KV Cache 是 vLLM 里最核心、也最复杂的模块之一：它决定了吞吐、显存占用、前缀复用，也贯穿了「调度器」和「执行器」两个进程。很多读者对着 `KVCacheConfig`、`KVCacheManager`、`BlockPool` 这些概念一头雾水，就是因为不知道**它们是在哪一步、由谁、为了什么被创建出来的**。
 
-```text
-vllm/v1/worker/gpu_model_runner.py
-```
+这篇文章的回答路径只有一条主线：
 
-## KV Cache 的作用
+> **探测显存 → 规划配置 → 下发到每个 rank → 真正分配物理显存 → warmup → 交给运行时按 block 调度使用**
 
-### 1. 为什么需要 KV Cache
+我们会顺着这条主线，把 vLLM 的代码一层层剥开，看到 `EngineCore`、`Executor`、`Worker`、`GPUModelRunner`、`KVCacheManager` 各自扮演的角色。
 
-Transformer 的自回归解码是一个「逐步生成、逐 token 计算」的过程。第 $t$ 个 token 计算 attention 时，需要和它之前的所有 token（包括 prompt 与已生成的 token）做交互。attention 的 Q/K/V 计算中：
+---
+
+## 一、先理解问题：KV Cache 是什么、为什么难管理
+
+动手看代码之前，先把「问题」本身想清楚。KV Cache 的难点不在"要不要缓存"，而在于：**它太大了，大到必须被当成一种受管理的资源来对待**。
+
+### 1.1 为什么需要 KV Cache
+
+Transformer 的自回归解码是一个「逐步生成、逐 token 计算」的过程。第 $t$ 个 token 计算 attention 时，需要和它之前的所有 token（prompt 与已生成的 token）做交互。attention 的 Q/K/V 计算中：
 
 - **Query（Q）** 只依赖当前正在计算的 token，每步都变；
 - **Key（K）/ Value（V）** 依赖历史 token 的内容，一旦某个历史 token 计算过就不会再变。
 
-如果不做缓存，每生成一个新 token 都要把整个前缀重新送入模型，重算所有历史 token 的 K 和 V，计算量随序列长度呈 $O(n^2)$ 增长。KV Cache 的思想是：**把已经计算过的历史 token 的 K/V 保存在显存里，每步只计算新 token 的 K/V，再从缓存里读取其余部分**。这样每个 decode 步的计算量降为 $O(n)$。
+如果不做缓存，每生成一个新 token 都要把整个前缀重新送入模型，重算所有历史 token 的 K 和 V，计算量随序列长度呈 $O(n^2)$ 增长。KV Cache 的思想是：**把已经算过的历史 token 的 K/V 保存在显存里，每步只算新 token 的 K/V，再从缓存里读取其余部分**。这样每个 decode 步的计算量降为 $O(n)$。
 
-### 2. KV Cache 是显存消耗的大头
+### 1.2 KV Cache 是显存消耗的大头
 
 KV Cache 的大小与多个维度成正比：
 
@@ -38,31 +43,27 @@ KV Cache 的大小与多个维度成正比：
 
 长上下文、大 batch、大模型场景下，KV Cache 往往超过模型权重本身，成为显存的第一消耗项。因此它不能简单用「分配一大块 tensor」的方式处理，而需要：
 
-- 显存预算（profiling 决定能分多少给 KV Cache）；
-- 按 block 的细粒度分配与回收（避免碎片化和浪费）；
-- 跨请求复用（prefix cache）。
+- **显存预算**：profiling 决定能分多少给 KV Cache；
+- **按 block 细粒度分配与回收**：避免碎片化和浪费；
+- **跨请求复用**：prefix cache，同样的前缀不重复算。
 
-### 3. vLLM 用「分页」思路管理 KV Cache
+### 1.3 vLLM 用「分页」思路管理 KV Cache
 
-vLLM 把 KV Cache 切成固定大小的 **block**（类似操作系统的内存页），每个请求持有一张 **block table**（逻辑 token 位置 → 物理 block 的映射）。好处是：
+vLLM 借鉴操作系统的虚拟内存，把 KV Cache 切成固定大小的 **block**（类似内存页），每个请求持有一张 **block table**（逻辑 token 位置 → 物理 block 的映射）。好处是：
 
-- 请求按需申请 block，用完即释放；
-- 不同的请求可以复用同一批物理 block（prefix cache 命中时直接共享，写入时再 copy-on-write）；
+- 请求按需申请 block，用完即释放，不会因为「最大长度预留」而浪费；
+- 不同请求可以复用同一批物理 block（prefix cache 命中时直接共享，写入时再 copy-on-write）；
 - 滑动窗口、Mamba 等特殊 attention 类型可以在 block 粒度上「跳过 / 回收」不再需要的部分。
 
-### 4. 与本文的关系
+> **核心要点**：KV Cache 不只是"一个缓存"，而是一套需要预算、分配、复用、回收的资源管理系统。后面的所有代码，本质上都在回答同一组问题——**分多少、怎么分、分给谁、用完怎么还**。
 
-本文描述 vLLM（`use_v2_model_runner=True`，即 `vllm/v1/worker/gpu/model_runner.py`）中 KV Cache 的完整生命周期：
+---
 
-1. **初始化**：探测显存 → 生成每个 rank 的 `KVCacheConfig` → 下发到 worker → 分配并绑定物理 KV tensor（本文一～六章）。
-2. **运行时管理**：调度阶段做 prefix 命中、分配/回收 block、零化与 copy-on-write（本文第九章）。
+## 二、整体调用链：先看全景
 
-理解 KV Cache 的上述作用后，再读后面的初始化和调度代码会更清楚每步在解决什么问题。
-
-## 一、整体调用链
+搞清楚问题之后，我们先建立全局视角。KV Cache 初始化发生在服务启动阶段，由 engine-core 进程统一驱动，跨进程协作完成。
 
 ![](../assets/Pasted%20image%2020260824195538.png)
-
 
 ```text
 EngineCore._initialize_kv_caches()
@@ -85,9 +86,15 @@ EngineCore._initialize_kv_caches()
             `-- collective_rpc("compile_or_warm_up_model")
 ```
 
-入口位于 `vllm/v1/engine/core.py` 的 `EngineCore._initialize_kv_caches()`。它负责规划 KV cache
+入口位于 `vllm/v1/engine/core.py` 的 `EngineCore._initialize_kv_caches()`。它负责规划 KV cache 配置，并通过 executor 的 collective RPC 下发给所有 worker。
 
-## 二、EngineCore：规划 KV Cache
+**一眼看懂这张图的关键**：engine-core 进程只负责"规划"，真正动手分配显存的是每个 worker 进程里的 `GPUModelRunner`。中间隔着一层 RPC，配置以 `list[KVCacheConfig]`（每个 rank 一份）的形式传过去。
+
+> **核心要点**：KV Cache 初始化是"一个中心（EngineCore 规划）+ 多个执行者（worker 分配）"的协作。后面三、四、五章分别是这张图的三个层次。
+
+---
+
+## 三、EngineCore：KV Cache 的全局规划
 
 入口 `EngineCore._initialize_kv_caches()`（`vllm/v1/engine/core.py`）的真实实现如下，每一步在下方展开：
 
@@ -106,8 +113,12 @@ def _initialize_kv_caches(self, vllm_config: VllmConfig) -> KVCacheConfig:
     if any(getattr(spec, "non_causal", False)
            for worker_specs in kv_cache_specs
            for spec in worker_specs.values()):
-        vllm_config.scheduler_config.enable_chunked_prefill = False
-        vllm_config.cache_config.enable_prefix_caching = False
+        if vllm_config.scheduler_config.enable_chunked_prefill:
+            logger.info("Disabling chunked prefill: model has non-causal attention layers.")
+            vllm_config.scheduler_config.enable_chunked_prefill = False
+        if vllm_config.cache_config.enable_prefix_caching:
+            logger.info("Disabling prefix caching: model has non-causal attention layers.")
+            vllm_config.cache_config.enable_prefix_caching = False
 
     # 4) 计算可用于 KV cache 的显存
     has_kv_cache = any(kv_cache_spec for kv_cache_spec in kv_cache_specs)
@@ -128,6 +139,11 @@ def _initialize_kv_caches(self, vllm_config: VllmConfig) -> KVCacheConfig:
     # 6) 生成 scheduler 视角的配置
     scheduler_kv_cache_config = generate_scheduler_kv_cache_config(kv_cache_configs)
     vllm_config.cache_config.num_gpu_blocks = scheduler_kv_cache_config.num_blocks
+    if scheduler_kv_cache_config.kv_cache_groups:
+        vllm_config.cache_config.block_size = min(
+            g.kv_cache_spec.block_size
+            for g in scheduler_kv_cache_config.kv_cache_groups)
+        update_kv_cache_capacity(vllm_config, scheduler_kv_cache_config)
     vllm_config.validate_block_size()
 
     # 7) 下发配置给 worker，真正分配 KV cache
@@ -142,7 +158,15 @@ def _initialize_kv_caches(self, vllm_config: VllmConfig) -> KVCacheConfig:
     return scheduler_kv_cache_config
 ```
 
-### 1. 注册 spec 类型：`register_all_kvcache_specs`
+这个方法可以概括成三个动作：
+
+1. **收集**（步骤 1-2）：知道模型有哪些 attention 层、各是什么类型的 KV cache；
+2. **规划**（步骤 3-6）：确定给 KV Cache 分多少显存、每个 rank 怎么分配、block 多大；
+3. **下发**（步骤 7-8）：把配置发下去真正分配，并触发编译与 warmup。
+
+下面逐个展开。
+
+### 3.1 注册 spec 类型：`register_all_kvcache_specs`
 
 `vllm/v1/core/single_type_kv_cache_manager.py:1897` 把每个 spec 类绑定到它的 manager 类，并声明 uniform 基类：
 
@@ -173,7 +197,9 @@ def register_all_kvcache_specs(vllm_config):
 
 作用：在 engine-core 进程内建立「spec 类 → manager 类」查找表，保证后续分组、校验和调度时都能找到对应 manager。
 
-### 2. 收集 spec：`get_kv_cache_specs`
+> 讲解提示：**spec** 描述"某一层需要什么样的 KV cache"（full / sliding window / mamba / cross-attention…），**manager** 描述"运行时怎么管理这种 cache"（分配、缓存、回收）。注册表就是把两者一一对应起来，同时允许不同 spec 复用同一个 manager（比如 MLA 归入 FullAttentionManager）。
+
+### 3.2 收集 spec：`get_kv_cache_specs`
 
 `vllm/v1/executor/abstract.py`：
 
@@ -184,18 +210,41 @@ def get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]:
 
 V2 runner 的 `get_kv_cache_spec()`（`gpu/model_runner.py`）对 encoder-only 返回 `{}`，否则调用 `get_kv_cache_spec(self.vllm_config)`。每个 worker 返回 `{layer_name: KVCacheSpec}`。
 
-### 3. non-causal 修正
+> 讲解提示：为什么是"每 rank 一份 dict"？因为启用了 pipeline parallel 时，不同 stage 上分布着不同层的模型，层名各不相同。这份 dict 就是各 worker 对"我这里有哪些层、各是什么类型"的自报家门。
+
+### 3.3 non-causal 修正：双向注意力不能用前缀缓存
+
+`non-causal`（非因果）模型，例如 BERT 等双向编码器模型，之所以不能开启前缀缓存（`enable_prefix_caching`）和分块预填充（`enable_chunked_prefill`），根本原因在于其**双向注意力机制**与这两个功能所依赖的**因果注意力（Causal Attention）假设**存在根本性冲突 [](https://docs.vllm.ai/en/v0.28.0/api/vllm/model_executor/layers/attention/prefill_prefix_lm_attention/)。
+
+具体原因如下：
+
+#### 核心原因：KV 缓存机制失效
+
+前缀缓存和分块预填充的核心，是缓存并复用之前计算好的 **KV Cache**。这个机制建立在**自回归生成**的假设上：每个新 token 只能"看到"它之前的所有 token（因果注意力）。
+
+然而，`non-causal` 模型（如 BERT）在编码时，允许每个 token **同时关注其左右两边的所有 token** [](https://docs.vllm.ai/en/v0.28.0/api/vllm/model_executor/layers/attention/prefill_prefix_lm_attention/)。这种"双向"的上下文依赖关系，使得 KV Cache 的值会因后续输入的变化而改变，**无法被简单地复用**。
+
+#### 注意力掩码（Attention Mask）不匹配
+
+前缀缓存和分块预填充的调度逻辑，**默认所有注意力计算都使用因果掩码（Causal Mask）** [](https://docs.vllm.ai/en/v0.28.0/api/vllm/model_executor/layers/attention/prefill_prefix_lm_attention/)。而 `non-causal` 模型必须使用**非因果掩码**，允许"看到未来"。如果在 `non-causal` 模型上强制开启这些功能，会导致**注意力计算错误，进而产生数值不一致或模型输出错误的结果**。
+
+因此 engine-core 在收集到带 `non_causal` 标记的 spec 时，会主动关掉这两个功能并打日志：
 
 ```python
 if any(getattr(spec, "non_causal", False)
-       for worker_specs in kv_cache_specs for spec in worker_specs.values()):
-    vllm_config.scheduler_config.enable_chunked_prefill = False
-    vllm_config.cache_config.enable_prefix_caching = False
+       for worker_specs in kv_cache_specs
+       for spec in worker_specs.values()):
+    if vllm_config.scheduler_config.enable_chunked_prefill:
+        logger.info("Disabling chunked prefill: model has non-causal attention layers.")
+        vllm_config.scheduler_config.enable_chunked_prefill = False
+    if vllm_config.cache_config.enable_prefix_caching:
+        logger.info("Disabling prefix caching: model has non-causal attention layers.")
+        vllm_config.cache_config.enable_prefix_caching = False
 ```
 
-### 4. 显存探测：`determine_available_memory`
+### 3.4 显存探测：`determine_available_memory`
 
-`GPUWorker.determine_available_memory()`（`gpu_worker.py:484`）核心：
+`GPUWorker.determine_available_memory()`（`gpu_worker.py:475`）核心：
 
 ```python
 @torch.inference_mode()
@@ -218,6 +267,8 @@ def determine_available_memory(self) -> int:
     return reserve_mm_ipc_gpu_memory(self.available_kv_cache_memory_bytes, ...)
 ```
 
+核心思想一句话：**用一个 dummy batch 跑一次前向，量出模型"吃"掉多少显存，剩下的才留给 KV Cache**。`gpu_memory_utilization`（默认 0.9）就是"允许占多少"的上限。
+
 注意 V2 中 `gpu/model_runner.py` 的 `profile_cudagraph_memory()` 当前是 no-op：
 
 ```python
@@ -226,11 +277,11 @@ def profile_cudagraph_memory(self) -> int:
     return 0
 ```
 
-因此 V2 不会在初始化阶段创建最小 KV cache 并临时捕获 CUDA graph 来估算显存。
+因此 V2 不会在初始化阶段创建最小 KV cache 并临时捕获 CUDA graph 来估算显存。注意 `cudagraph_memory_estimate_applied` 受环境变量 `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS` 控制（默认开启）：关闭时 `cudagraph_memory_estimate` 不会从 KV cache 预算中扣除。
 
-### 5. 生成每 rank 配置：`get_kv_cache_configs`
+### 3.5 生成每 rank 配置：`get_kv_cache_configs`
 
-`vllm/v1/core/kv_cache_utils.py:2088` 的真实流程：
+`vllm/v1/core/kv_cache_utils.py:2082` 的真实流程：
 
 ```python
 def get_kv_cache_configs(vllm_config, kv_cache_specs, available_memory):
@@ -286,9 +337,11 @@ def get_kv_cache_configs(vllm_config, kv_cache_specs, available_memory):
 
 关键点：合并 spec → 分组 → 按 PP 投影 → auto-fit / 校验 → 每 rank 独立建配置 → 收敛到最小 `num_blocks`，保证所有 worker 一致。
 
-#### 5a. 层分组：`get_kv_cache_groups`
+> 讲解提示：第 (j) 步很有意思——不同 rank 的显存可能不同（比如多卡不均衡），但调度器要求所有 rank 的 block 数一致，所以**取所有 rank 里最小的那个**，并把 tensor 按比例缩小，避免多分配的显存闲置。
 
-`kv_cache_utils.py:1747` 分支顺序：
+#### 3.5.1 层分组：`get_kv_cache_groups`
+
+`kv_cache_utils.py:1741` 分支顺序：
 
 ```python
 def get_kv_cache_groups(vllm_config, kv_cache_spec):
@@ -308,7 +361,9 @@ def get_kv_cache_groups(vllm_config, kv_cache_spec):
     return groups
 ```
 
-#### 5b. 物理布局：`get_kv_cache_config_from_groups`
+> 讲解提示：**group 是"共享同一份 block table 语义的层的集合"**。大部分模型所有层完全一样，就是一个 group；混合模型（如 DeepSeek V4 的 full + sliding window、Mamba 混合模型）会拆成多个 group。分组的目的是让"同类层"共用内存池、统一 block 大小，从而减少内存碎片。
+
+#### 3.5.2 物理布局：`get_kv_cache_config_from_groups`
 
 `kv_cache_utils.py:1327` 决定 `num_blocks` 与 `kv_cache_tensors`：
 
@@ -346,9 +401,9 @@ def get_kv_cache_config_from_groups(vllm_config, kv_cache_groups, available_memo
 
 说明：`num_blocks` 是逻辑 block 数；`kv_cache_tensors` 描述物理 tensor 如何分配、哪些层共享一个 tensor。
 
-### 6. scheduler 配置与 block size
+### 3.6 scheduler 配置与 block size
 
-`generate_scheduler_kv_cache_config`（`kv_cache_utils.py:1832`）：
+`generate_scheduler_kv_cache_config`（`kv_cache_utils.py:1826`）：
 
 ```python
 def generate_scheduler_kv_cache_config(kv_cache_configs):
@@ -359,6 +414,19 @@ def generate_scheduler_kv_cache_config(kv_cache_configs):
             group.kv_cache_spec = next(
                 iter(group.kv_cache_spec.kv_cache_specs.values()))
     return cfg
+```
+
+随后 EngineCore 用该配置同步 `num_gpu_blocks`、取各 group 最小的 `block_size` 写入 `cache_config.block_size`，并调用 `update_kv_cache_capacity` 记录容量日志：
+
+```python
+scheduler_kv_cache_config = generate_scheduler_kv_cache_config(kv_cache_configs)
+vllm_config.cache_config.num_gpu_blocks = scheduler_kv_cache_config.num_blocks
+kv_cache_groups = scheduler_kv_cache_config.kv_cache_groups
+if kv_cache_groups:
+    vllm_config.cache_config.block_size = min(
+        g.kv_cache_spec.block_size for g in kv_cache_groups)
+    update_kv_cache_capacity(vllm_config, scheduler_kv_cache_config)
+vllm_config.validate_block_size()
 ```
 
 `resolve_kv_cache_block_sizes`（`kv_cache_utils.py:607`）计算两个粒度：
@@ -376,9 +444,15 @@ def resolve_kv_cache_block_sizes(kv_cache_config, vllm_config):
 
 随后 EngineCore 用 `scheduler_block_size` / `hash_block_size` 创建 Scheduler，Scheduler 内部再据此构建 `KVCacheManager`。
 
-## 三、Executor 和 WorkerWrapperBase：分发配置
+> **核心要点**：EngineCore 这一步产出了两类对象——**给 worker 的 `KVCacheConfig`**（每个 rank 一份，描述物理分配）和**给 scheduler 的 `KVCacheConfig`**（统一一份，描述逻辑管理）。物理与逻辑的分工，从这里开始成型。
 
-### 1. Executor 入口
+---
+
+## 四、Executor 与 WorkerWrapperBase：把配置分发到每个 rank
+
+规划完成，接下来是怎么把配置"送"到每个 worker。
+
+### 4.1 Executor 入口
 
 当前方法名是 `initialize_from_config`，不是 `initialize`：
 
@@ -397,7 +471,7 @@ def initialize_from_config(
 
 `compile_or_warm_up_model()` 也通过 `collective_rpc` 在所有 worker 上执行，并把各 worker 返回的 `CompilationTimes` 汇总回 engine-core。
 
-### 2. WorkerWrapperBase 按 rank 选择配置
+### 4.2 WorkerWrapperBase 按 rank 选择配置
 
 ```python
 # vllm/v1/worker/worker_base.py
@@ -410,7 +484,15 @@ def initialize_from_config(self, kv_cache_configs: list[Any]) -> None:
 
 因此，Executor 下发的是配置列表；每个 worker 只使用与自身 `global_rank` 对应的 `KVCacheConfig`。
 
-## 四、GPUWorker：进入 ModelRunner V2
+> **核心要点**：配置列表的**顺序**就是 rank 的顺序。`collective_rpc` 保证所有 worker 同时收到，各自"认领"自己的那份。这是一个简单但很重要的约定：任何地方都不需要额外的映射逻辑。
+
+---
+
+## 五、GPUWorker 与 ModelRunner V2：真正的分配与绑定
+
+配置到了 worker，接下来的动作才真正动显存。
+
+### 5.1 实例化 V2 runner
 
 当 `vllm_config.use_v2_model_runner` 为 `True` 时，`GPUWorker.init_device()`（`gpu_worker.py`）实例化：
 
@@ -444,9 +526,9 @@ def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         self.model_runner._init_kv_zero_meta()
 ```
 
-## 五、ModelRunner V2：正式初始化 KV Cache
+### 5.2 `initialize_kv_cache`：核心入口
 
-V2 的核心入口是 `gpu/model_runner.py:500` 的 `initialize_kv_cache`，完整实现如下：
+V2 的核心入口是 `gpu/model_runner.py:495` 的 `initialize_kv_cache`，完整实现如下：
 
 ```python
 def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
@@ -466,11 +548,16 @@ def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
     for group in kv_cache_config.kv_cache_groups:
         spec = group.kv_cache_spec
         block_sizes.append(spec.block_size)
-        max_num_blocks = spec.max_num_blocks_per_req(
-            self.vllm_config, block_table_max_model_len)
+        # DCP 时本 rank 一个 block 覆盖 block_size * cp_size 个全局 token
+        max_num_blocks = cdiv(
+            block_table_max_model_len, spec.block_size * self.dcp_size)
         if isinstance(spec, MambaSpec):
-            max_num_blocks = get_block_table_width(max_num_blocks, spec.block_size,
-                                                   token_alignment=None)
+            # Mamba 状态跨 DCP/PCP 复制不切分，行宽额外加 speculative blocks
+            max_num_blocks = (
+                max_num_blocks if self.cache_config.enable_prefix_caching else 1
+            ) + spec.num_speculative_blocks
+            max_num_blocks = get_block_table_width(
+                max_num_blocks, spec.block_size, token_alignment=None)
         else:
             max_num_blocks = get_block_table_width(max_num_blocks, spec.block_size)
         max_num_blocks_per_group.append(max_num_blocks)
@@ -478,9 +565,13 @@ def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
     # (3) 初始化 attention groups、backend 与 kernel block size
     self.attn_groups, attn_cg_support, self.kernel_block_sizes = init_attn_backend(
         self.kv_cache_config, self.vllm_config, self.device)
+    attn_cg_support = attn_cg_support.narrow(
+        *self.model_state.get_additional_cg_support())
 
-    # (4) 自适应验证（spec decode 相关）
+    # (4) 自适应验证（spec decode 相关）；启用后强制 FULL_AND_PIECEWISE 模式
     self.adaptive_verification = maybe_create_adaptive_verification_manager(...)
+    if self.adaptive_verification is not None:
+        self.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
 
     # (5) 创建 block table / PCP manager
     self.block_tables = BlockTables(block_sizes=block_sizes,
@@ -515,6 +606,11 @@ def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
     self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
 ```
 
+> 讲解提示：这个方法虽然长，但只做了三类事：
+> 1. **尺寸计算**（步骤 1-2）：每个 group 的 block 大小、每个请求的 block table 行宽（考虑 encoder 长度、DCP、Mamba）；
+> 2. **运行时对象准备**（步骤 3-8）：attention backend、block tables、PCP manager、CUDA graph 模式、speculator；
+> 3. **真正分配**（步骤 9-10）：分配物理内存、绑定到各层、创建 KV connector。
+
 `init_kv_cache`（`gpu/attn_utils.py:545`）内部三步：
 
 ```python
@@ -536,7 +632,11 @@ def init_kv_cache(runner_kv_caches, forward_context, kv_cache_config,
 
 注意：V2 的 `initialize_kv_cache` **没有** V1 中的 `may_add_encoder_only_layers_to_kv_cache_config()` 调用；V2 在 `get_kv_cache_spec()` 阶段对 encoder-only 直接返回空 dict，encoder-only 层在 scheduler 与 runner 两侧的处理方式与 V1 不同。
 
-## 六、ModelRunner V2 的 warmup 和编译
+> **核心要点**：分配不是"allocate 一个 tensor 就完事"，而是 **raw tensor（一大块内存）→ 按层 reshape 成视图 → 绑定到每个 attention 层** 三步。`kv_cache_tensors` 里 `shared_by` 字段决定了哪些层共享同一块内存（这是多 group 模型省显存的关键）。
+
+---
+
+## 六、warmup 与编译：让 GPU 提前"热身"
 
 EngineCore 在完成 KV cache 初始化后调用：
 
@@ -549,13 +649,33 @@ Executor 通过 RPC 调用每个 worker 的 `compile_or_warm_up_model()`。该�
 
 因此，V2 的 warmup 不能直接套用 V1 runner 中 `self.model_runner._dummy_run(size)` 的完整实现说明。
 
-## 七、运行时新 KV block 的清零
+> 讲解提示：warmup 为什么必须在 KV cache 分配**之后**？因为 warmup 的 dummy run 和 CUDA graph 捕获都要真的读写 KV cache，只有先分配好物理显存，才能让 kernel 以真实的形状和内存布局跑一遍，避免运行时首次触发 kernel 编译的"卡顿"。
 
-正式初始化时，V2 会根据 KV cache 配置准备 zeroing 所需的 metadata。推理过程中，scheduler 将新分配的 block id 放入 scheduler output，V2 runner 在更新请求状态时处理这些 block，清零新 block，避免复用的显存残留旧数据。
+---
 
-这个过程属于 V2 `execute_model()` 的状态更新路径，不应引用 V1 runner 的属性名或伪代码，例如 `self.kv_block_zeroer is not None`。具体 zeroing 实现由 V2 runner 及其 KV cache/block table 工具负责，并与 attention backend 的 cache layout 保持一致。
+## 七、运行时的新 block 清零
 
-## 八、Scheduler 衔接和总结
+KV Cache 是会被**复用**的：请求结束释放的 block，可能被下一个请求拿到。如果不清零，新请求会读到上一个请求残留的脏数据，污染 attention / SSM 计算。所以 vLLM 在"新 block 被用到之前"清零。
+
+正式初始化时，`GPUWorker.initialize_from_config` 在 CuMem 池外调用 V2 runner 的 `_init_kv_zero_meta()`（`gpu/model_runner.py:621`），创建 `KVBlockZeroer` 并保存为 `self.kv_block_zeroer`。warmup 阶段（`gpu/warmup.py:292`）还会调用 `kv_block_zeroer.warmup(num_blocks)` 预构建按 `kernel_block_sizes` 与 `cache_dtype` 对齐的零化 bookkeeping tensor。
+
+推理过程中，scheduler 每步把新分配的 block id 放入 `SchedulerOutput.new_block_ids_to_zero` 下发。V2 runner 在 `update_requests()`（`gpu/model_runner.py:1036`）中消费：
+
+```python
+if scheduler_output.new_block_ids_to_zero:
+    assert self.kv_block_zeroer is not None
+    self.kv_block_zeroer.zero_block_ids(scheduler_output.new_block_ids_to_zero)
+```
+
+`KVBlockZeroer` 对物理 KV tensor 上对应 block 清零，避免复用的显存残留旧数据污染 attention/SSM 计算。它属于 V2 runner 的 `update_requests`（execute 前状态更新）路径，不涉及 V1 runner 的实现。
+
+> **核心要点**：清零不是"分配时一次做完"，而是**调度器在每步把新 block 的 id 报给 worker，worker 在 forward 之前清掉**。这样既不需要预清零全部显存（省时间），又能保证每次复用都安全。
+
+---
+
+## 八、Scheduler 衔接：逻辑管理与物理 tensor 的分工
+
+到这里，初始化完成。但 KV Cache 的管理才刚刚开始——初始化产出的配置，要交给调度器去用。
 
 EngineCore 返回 `scheduler_kv_cache_config`。随后 Scheduler 使用该配置创建 KV cache manager 和 block manager；worker 则持有各自 rank 的完整 `KVCacheConfig` 和已经分配好的物理 cache。
 
@@ -585,7 +705,14 @@ vllm/v1/engine/core.py
     -> vllm/v1/worker/gpu/model_runner.py
 ```
 
-## 九、初始化后的 KV cache 管理与使用
+> **核心要点**：记住这条边界——
+> - **engine-core 侧**：`Scheduler` + `KVCacheManager`，只知道"逻辑 block"，不碰显存；
+> - **worker 侧**：V2 `GPUModelRunner` + 物理 KV tensor，只知道"物理 block"，不参与调度。
+> 两者每步通过 `SchedulerOutput` 交换 block id 与零化/拷贝指令。
+
+---
+
+## 九、初始化之后：KV Cache 的运行时管理
 
 初始化完成后，存在两套协同状态：**engine-core 侧的逻辑管理**（scheduler + `KVCacheManager`）和 **worker 侧的物理 KV tensor**。运行时每个 step 都在两者之间往返 block id 与零化/拷贝指令。
 
@@ -608,7 +735,7 @@ if self.connector is not None:
     self.connector.bind_gpu_block_pool(self.kv_cache_manager.block_pool)
 ```
 
-`KVCacheManager.__init__`（`kv_cache_manager.py:118`）内部：
+`KVCacheManager.__init__`（`kv_cache_manager.py:119`）内部：
 
 ```python
 self.coordinator = get_kv_cache_coordinator(kv_cache_config=..., ...)  # 选择 coordinator
@@ -617,7 +744,7 @@ self.watermark_blocks = int(watermark * kv_cache_config.num_blocks)
 self.empty_kv_cache_blocks = KVCacheBlocks(tuple(() for _ in range(num_groups)))
 ```
 
-`get_kv_cache_coordinator`（`kv_cache_coordinator.py:923`）按场景三选一：
+`get_kv_cache_coordinator`（`kv_cache_coordinator.py:915`）按场景三选一：
 
 ```python
 if not enable_caching:
@@ -640,6 +767,9 @@ KVCacheManager（调度协调层）
                     ├── req_to_blocks: request_id -> [KVCacheBlock]
                     └── num_cached_block: request_id -> 已缓存 block 数
 ```
+
+> 讲解提示：三层结构各司其职——
+> `KVCacheManager`（对外统一入口）→ `KVCacheCoordinator`（按场景选策略）→ 每 group 一个 `SingleTypeKVCacheManager`（干具体活）+ 共享的 `BlockPool`（管物理 block 的分配、引用计数、哈希索引）。之前注册表里的"spec → manager"映射，在这里真正生效。
 
 ### 9.2 单类型管理器：`SingleTypeKVCacheManager` 基类
 
@@ -690,7 +820,7 @@ new_blocks = self.kv_cache_manager.allocate_slots(
     request, num_new_tokens, num_lookahead_tokens=...)
 ```
 
-`KVCacheManager.get_computed_blocks`（`kv_cache_manager.py:248`）做前缀查找：
+`KVCacheManager.get_computed_blocks`（`kv_cache_manager.py:232`）做前缀查找：
 
 ```python
 def get_computed_blocks(self, request):
@@ -704,7 +834,7 @@ def get_computed_blocks(self, request):
     return self.create_kv_cache_blocks(computed_blocks), num_new_computed_tokens, boundary
 ```
 
-`KVCacheManager.allocate_slots`（`kv_cache_manager.py:355`）分阶段：
+`KVCacheManager.allocate_slots`（`kv_cache_manager.py:347`）分阶段：
 
 ```python
 # 1) 释放窗口外 skip block，并检查自由 block 是否足够（不足返回 None -> 触发抢占）
@@ -813,3 +943,37 @@ def update_requests(self, scheduler_output):
 - **物理 tensor** 由 V2 runner 持有，`BlockTables` 维护请求块表，`KVBlockZeroer` 保证复用块被清零。
 - **前缀复用** 依赖 `block_hashes` 与 `BlockPool` 的哈希索引；滑动窗口/Mamba 等稀疏保留类型在 `remove_skipped_blocks` / `cache_blocks` 里用 null block 或 mask 跳过不可复用的块。
 - **引用计数 + 延迟释放** 保证 async 调度与 KV connector 写竞争下不会过早回收正在被读写的 block。
+
+---
+
+## 十、回顾与延伸
+
+### 10.1 一图流回顾
+
+```text
+启动阶段：                             运行阶段（每个 step）：
+Worker 自报 spec（哪些层要什么 cache）    Scheduler.get_computed_blocks()  ← prefix 命中
+GPUWorker 探测可用显存                    Scheduler.allocate_slots()        ← 分配/回收 block
+EngineCore 规划 KVCacheConfig（每 rank）  SchedulerOutput(new_block_ids,
+  └─ 分组 / auto-fit / 收敛最小 blocks       new_block_ids_to_zero, copies)
+Executor 经 collective_rpc 下发           └─> worker update_requests()
+WorkerWrapperBase 按 global_rank 认领       ├─ BlockTables.append_block_ids
+GPUWorker + V2 Runner.initialize_kv_cache   ├─ KVBlockZeroer.zero_block_ids
+  └─ 分配 raw tensor -> reshape -> bind     └─ copy_kv_cache_blocks_inplace（CoW）
+GPUWorker compile_or_warm_up_model        forward 读写物理 KV cache
+Scheduler 用同一配置构建 KVCacheManager   update_from_output 归还结束请求的 block
+```
+
+### 10.2 想深入，可以接着看这些
+
+- **`BlockPool`**（`vllm/v1/core/block_pool.py`）：引用计数、null block、哈希索引、驱逐策略——prefix cache 的物理基础；
+- **`KVCacheCoordinator` 三兄弟**（`vllm/v1/core/kv_cache_coordinator.py`）：NoPrefix / Unitary / Hybrid 的策略差异；
+- **`KVBlockZeroer`**（`vllm/v1/worker/utils.py`）：零化的 CUDA 实现；
+- **DeepSeek V4 的 packed 布局**（`kv_cache_utils.py` 的 `_use_packed_kv_cache_config` / `_get_kv_cache_config_packed`）：多 group 共享内存池的高级玩法；
+- **KV transfer（connector）**：P/D 分离、KV offload 场景下 block 池如何在进程间流动。
+
+### 10.3 三个最值得记住的"心智模型"
+
+1. **KV Cache 是一种受管资源**：预算、分配、复用、回收——所有机制都围绕这四个词展开；
+2. **规划与执行分离**：engine-core 只做逻辑规划，worker 才碰物理显存，中间靠 `collective_rpc` + "配置列表按 rank 索引"通信；
+3. **每步协作**：调度器管"逻辑 block"，runner 管"物理 tensor"，通过 `SchedulerOutput` 交换 block id、零化与拷贝指令。
