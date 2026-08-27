@@ -13,6 +13,57 @@ KV Cache 是 vLLM 里最核心、也最复杂的模块之一：它决定了吞�
 
 我们会顺着这条主线，把 vLLM 的代码一层层剥开，看到 `EngineCore`、`Executor`、`Worker`、`GPUModelRunner`、`KVCacheManager` 各自扮演的角色。
 
+### 先读这张表：同一单词的不同含义
+
+源码里有几组**同一个词在不同层级/语境下含义完全不同**的参数，是读代码时最容易踩坑的地方。先建立心智模型，后面每遇到一个都能对号入座。
+
+**① "block size" 家族（5 种含义）**
+
+| 参数名 | 位置 | 单位 | 真实含义 |
+|---|---|---|---|
+| `spec.block_size` | `KVCacheSpec` | token | 逻辑 block 大小，决定 block table 语义 |
+| `scheduler_block_size` | `resolve_kv_cache_block_sizes` | token | 调度对齐粒度（单 group = block_size×dcp；多 group = LCM） |
+| `hash_block_size` | 同上 | token | prefix 哈希粒度（单 group = scheduler size；多 group = GCD 或 prefix_match_unit） |
+| `kernel_block_size` | `init_kv_cache` / `KVBlockZeroer` | token | attention backend 的 kernel 对齐粒度（虚拟 block 拆分） |
+| `block_stride` | `KVCacheTensor`（packed 布局） | **字节** | 每 block 的字节跨度 |
+
+前四个单位都是 token，但语义各不相交；`block_stride` 单位还是字节。读代码时"block_size"几乎每个函数都要重新心算一遍。
+
+**② `page_size`（字节） vs `block_size`（token）**
+
+- `page_size_bytes`（`KVCacheSpec` 属性）单位是**字节**，用于 `available_memory // page_size` 这类字节运算；
+- `block_size` 单位是 **token**，用于 `cdiv(max_len, block_size)` 这类 token 运算。
+
+两者词根混用（page/block），一个是字节、一个是 token，相除操作也完全不同。
+
+**③ `num_blocks` 的两种含义**
+
+- `KVCacheConfig.num_blocks` = **全局物理 block pool 的容量**（全 rank 收敛到一致值）；
+- `initialize_kv_cache` 里的 `max_num_blocks_per_group` = **单个请求 block table 的行宽**（每请求最多多少块）。
+
+"池容量"与"单请求行宽"都叫 blocks，在第五章的同函数里并存。
+
+**④ `memory` 家族（6 个名字）**
+
+| 名字 | 含义 |
+|---|---|
+| `kv_cache_memory_bytes` | 用户手动指定的 KV cache 大小 |
+| `available_kv_cache_memory_bytes` | worker profiling 算出的可用量 |
+| `available_memory` / `available_gpu_memory` | executor 汇总的各 worker 可用量（`list[int]`） |
+| `requested_memory` | gpu_memory_utilization × 总显存 |
+| `non_kv_cache_memory` | 权重 + 激活占用的非 KV 部分 |
+| `cudagraph_memory_estimate(_applied)` | CUDA Graph 预估占用（是否扣除受环境变量门控） |
+
+另外注意 `determine_available_memory` 名字叫 "available memory"，返回值却是**扣除了多模态 IPC 共享内存、并经过 `reserve_mm_ipc_gpu_memory` 处理后的 KV cache 专属可用量**，不是裸显存。
+
+**⑤ 其余容易误读的细节**
+
+- `get_kv_cache_groups(vllm_config, kv_cache_spec)` 与 `_project_kv_cache_groups_to_worker(..., worker_spec)` 的 `kv_cache_spec` / `worker_spec` **实为 `dict[str, KVCacheSpec]`（层名 → spec 的映射）**，不是单个 spec；对比 `SingleTypeKVCacheManager(kv_cache_spec, ...)` 里才是真正的单个 spec；
+- `get_num_blocks(vllm_config, num_layers, ...)` 的参数名叫 `num_layers`，调用时传入的**实为 `group_size`（共享内存池数量）**，单 group 时两者相等、多 group 时不等；
+- `available_memory` 在 `get_kv_cache_configs` 是 `list[int]`（每 worker 一个），在 `get_kv_cache_config_from_groups` / `get_num_blocks` 是单个 `int`，维度随层级不同；
+- `init_kv_cache(runner_kv_caches, ...)` 的 `runner_kv_caches` 是**作为输出被填充的 list**，不是输入；
+- `max_num_blocks_per_req(vllm_config, max_len)` 的 `max_len` 对 encoder-decoder 要传**含 encoder 长度**的值，与 `max_model_len`（仅 decoder）语义不同。
+
 ---
 
 ## 一、先理解问题：KV Cache 是什么、为什么难管理
@@ -359,8 +410,8 @@ def get_kv_cache_configs(vllm_config, kv_cache_specs, available_memory):
 - **(a) 合并 spec —— 建立"整模型视角"**。PP 下每个 worker 只拥有部分层（stage0 有 0-15 层、stage1 有 16-31 层），各自上报的 spec 只是全局的子集；TP 下同 stage 的各 rank 层相同。这里把散落的 spec 合并成一份"全模型层 → spec"映射。如果同一层在不同 worker 上报了不同 spec，直接 assert 失败——同层类型必须一致，这是跨 rank 一致性的第一道防线。
 - **(b) 校验注册 —— 防止"运行时找不到 manager"**。`check_kv_cache_spec_registry` 逐个确认 spec 类都在 `register_all_kvcache_specs` 里注册过。注册表是 spec → manager 的映射，漏注册会在分组 / 调度阶段才爆雷，提前到启动期报错更友好。
 - **(c) MTP 标记 —— 给滑动窗口"留尾巴"**。使用多模块 MTP（多个 speculative module）时，给每个 `SlidingWindowSpec` 打上 `extra_retained_tokens = num_speculative_tokens - 1`。原因：sliding window 只保留最近窗口的 token，而 MTP 的 store 侧比主模型延迟一拍，若窗口边界正好卡在 MTP 需要的 token 上，缓存里就重建不出窗口，所以要额外保留这些 token。
-- **(d) 全局分组 —— 见 3.5.1**。`get_kv_cache_groups` 把"整模型"的层按 attention 类型分成若干个 group（full / sliding window / mamba / cross-attention…）。注意它可能**原地修改** `merged_kv_cache_specs`（例如强制统一混合类型的 page size）。
-- **(e) 按 PP 投影 —— 每个 worker 只看自己的层**。`_project_kv_cache_groups_to_worker` 把全局 group 过滤成只含本 worker 层的子集（`UniformTypeKVCacheSpecs` 里的 per-layer spec 也同步裁剪）。这一步之后，"显存能支撑多少 block"就只和该 worker 自己拥有的层相关。
+- **(d) 全局分组 —— 见 3.5.1**。`get_kv_cache_groups` 把"整模型"的层按 attention 类型分成若干个 group（full / sliding window / mamba / cross-attention…）。注意它可能**原地修改** `merged_kv_cache_specs`（例如强制统一混合类型的 page size）。⚠️ 参数名 `kv_cache_spec` **实为 `dict[str, KVCacheSpec]`（层名 → spec 映射）**，不是单个 spec。
+- **(e) 按 PP 投影 —— 每个 worker 只看自己的层**。`_project_kv_cache_groups_to_worker` 把全局 group 过滤成只含本 worker 层的子集（`UniformTypeKVCacheSpecs` 里的 per-layer spec 也同步裁剪）。这一步之后，"显存能支撑多少 block"就只和该 worker 自己拥有的层相关。⚠️ 参数 `worker_spec` 同样是 dict，与 (d) 同一命名陷阱。
 - **(f) override 换算 —— 用户指定块数时重新校准**。若设置了 `--num-gpu-blocks-override`，实际分配块数与 profiling 出的 `available_memory` 解耦。这里用 `_pool_bytes_per_block` 把 override 换算回 "effective memory"（override × 每 block 字节），让后面的 auto-fit、显存检查、per-worker 配置都基于**同一个有效容量**规划，避免三处对不上。
 - **(g) auto-fit max_model_len —— 二分搜索最大可支持上下文**。当用户没指定 `max_model_len`（`original_max_model_len == -1`）时，估算现有显存能装下的最长上下文，取**所有 worker 中能支撑的最小值**（最弱一环），必要时原地改写 `model_config.max_model_len`。这正是 EngineCore 之后比较 `max_model_len_before/after` 并调 `update_max_model_len` 把新值同步给 worker 的原因。
 - **(h) 显存足够性检查 —— 启动期就"报错不隔夜"**。逐 worker 计算在 max_model_len 下"至少服务一个请求"需要多少 KV 显存（`_max_memory_usage_bytes_from_groups`），与可用显存比较。不足则直接抛错，并给出"估算最大长度""建议提高 `gpu_memory_utilization` 或降低 `max_model_len`"等可操作提示。
@@ -435,7 +486,7 @@ def get_kv_cache_config_from_groups(vllm_config, kv_cache_groups, available_memo
         # 通用多 group：group_size 个内存池，每个池被各 group 的同序号层共享
         group_size = max(len(g.layer_names) for g in kv_cache_groups)
         page_size = get_uniform_page_size([g.kv_cache_spec for g in kv_cache_groups])
-        num_blocks = get_num_blocks(vllm_config, group_size, available_memory, page_size)
+        num_blocks = get_num_blocks(vllm_config, group_size, available_memory, page_size)  # ⚠️ 参数名是 num_layers，实为 group_size
         for i in range(group_size):
             shared_by = [g.layer_names[i] for g in kv_cache_groups
                          if i < len(g.layer_names)]
@@ -828,8 +879,8 @@ self.kv_cache_manager = KVCacheManager(
     max_model_len=self.max_model_len,
     max_in_flight_tokens=vllm_config.max_in_flight_tokens,
     enable_caching=self.cache_config.enable_prefix_caching,
-    scheduler_block_size=self.block_size,
-    hash_block_size=hash_block_size,
+    scheduler_block_size=self.block_size,   # 调度对齐粒度（token）
+    hash_block_size=hash_block_size,        # prefix 哈希粒度（token）；两者关系见 3.6
     watermark=self.scheduler_config.watermark,
     ...)
 # 绑定 GPU block pool 给 KV connector（必须在 manager 构建后，block_pool 已就绪）
