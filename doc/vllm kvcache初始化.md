@@ -47,6 +47,30 @@ KV Cache 的大小与多个维度成正比：
 - **按 block 细粒度分配与回收**：避免碎片化和浪费；
 - **跨请求复用**：prefix cache，同样的前缀不重复算。
 
+> **举两个例子感受一下量级**（均设 KV 为 fp16，`head_size = 128`，GQA 8 个 KV head）：
+>
+> **例 1：Qwen2.5-7B / Llama-3.1-8B（32 层）**
+> 每个 token、每层占 $2 \times 8 \times 128 \times 2 = 4\ \text{KiB}$，32 层合计每个 token 128 KiB。
+>
+> ```text
+> 32K 上下文：128 KiB × 32,768 ≈ 4 GiB
+> 128K 上下文：128 KiB × 131,072 ≈ 16 GiB
+> ```
+>
+> 该模型权重（8B 参数 × 2 B）约 16 GiB——**单请求 128K 上下文的 KV Cache 就与全部权重一样大**；同时并发 4 个这样的请求，KV Cache 即达权重的 4 倍。
+>
+> **例 2：Llama-3.1-70B（80 层）**
+> 每个 token 占 $2 \times 8 \times 128 \times 2 \times 80 = 320\ \text{KiB}$。
+>
+> ```text
+> 128K 上下文：320 KiB × 131,072 ≈ 40 GiB
+> 并发 8 个请求：320 GiB  vs  70B 权重（fp16）约 130 GiB
+> ```
+>
+> 只跑 8 个 128K 请求，KV Cache（320 GiB）就是全部权重（约 130 GiB）的 **2 倍以上**。
+>
+> 这也是为什么 KV Cache 必须"精打细算"：即便用 GQA 已经把 KV head 从 32~64 压到 8 个，显存消耗依然惊人，任何分配浪费都难以接受。
+
 ### 1.3 vLLM 用「分页」思路管理 KV Cache
 
 vLLM 借鉴操作系统的虚拟内存，把 KV Cache 切成固定大小的 **block**（类似内存页），每个请求持有一张 **block table**（逻辑 token 位置 → 物理 block 的映射）。好处是：
