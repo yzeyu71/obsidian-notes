@@ -295,15 +295,6 @@ def determine_available_memory(self) -> int:
 
 核心思想一句话：**用一个 dummy batch 跑一次前向，量出模型"吃"掉多少显存，剩下的才留给 KV Cache**。`gpu_memory_utilization`（默认 0.9）就是"允许占多少"的上限。
 
-注意 V2 中 `gpu/model_runner.py` 的 `profile_cudagraph_memory()` 当前是 no-op：
-
-```python
-def profile_cudagraph_memory(self) -> int:
-    # NOTE(woosuk): It is TBD whether we keep this API or not.
-    return 0
-```
-
-因此 V2 不会在初始化阶段创建最小 KV cache 并临时捕获 CUDA graph 来估算显存。注意 `cudagraph_memory_estimate_applied` 受环境变量 `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS` 控制（默认开启）：关闭时 `cudagraph_memory_estimate` 不会从 KV cache 预算中扣除。
 
 ### 3.5 生成每 rank 配置：`get_kv_cache_configs`
 
