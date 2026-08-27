@@ -55,6 +55,8 @@ vLLM 借鉴操作系统的虚拟内存，把 KV Cache 切成固定大小的 **bl
 - 不同请求可以复用同一批物理 block（prefix cache 命中时直接共享，写入时再 copy-on-write）；
 - 滑动窗口、Mamba 等特殊 attention 类型可以在 block 粒度上「跳过 / 回收」不再需要的部分。
 
+![](../assets/Pasted%20image%2020260827114959.png)
+
 > **核心要点**：KV Cache 不只是"一个缓存"，而是一套需要预算、分配、复用、回收的资源管理系统。后面的所有代码，本质上都在回答同一组问题——**分多少、怎么分、分给谁、用完怎么还**。
 
 ---
@@ -638,6 +640,18 @@ def init_kv_cache(runner_kv_caches, forward_context, kv_cache_config,
 
 ## 六、warmup 与编译：让 GPU 提前"热身"
 
+### 6.1 这一节在解决什么问题
+
+一句话：**warmup 是 vLLM 正式对外服务前的"彩排"**。它用假的（dummy）请求把模型完整跑几遍，让所有"临场才发生的编译 / 调优"在第一个真实请求到来之前完成。
+
+如果跳过这步，第一个真实请求会**边跑边现场编译**：
+
+- 自定义 / Triton kernel 第一次遇到某个形状才开始 JIT 编译；
+- torch.compile 的图没有编过；
+- CUDA Graph 没有捕获。
+
+结果就是**第一个 token 的延迟暴涨**（vLLM 常见的"冷启动卡顿"）。
+
 EngineCore 在完成 KV cache 初始化后调用：
 
 ```python
@@ -645,21 +659,117 @@ if not envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
     self.model_executor.compile_or_warm_up_model()
 ```
 
-Executor 通过 RPC 调用每个 worker 的 `compile_or_warm_up_model()`。该方法实际定义在 `GPUWorker`，不是 V2 `GPUModelRunner` 的方法。GPUWorker 会根据 compilation 配置调用 V2 runner 的 `_dummy_run()`，执行 `kernel_warmup(self)`，并在非 eager 模式下调用 V2 runner 的 `capture_model()`。具体行为受 compilation mode、cudagraph mode、capture sizes、speculative decoding 和 multimodal 配置影响。
+Executor 通过 RPC 调用每个 worker 的 `compile_or_warm_up_model()`。注意：**这个方法定义在 `GPUWorker` 上**（`gpu_worker.py:693`），不是 V2 `GPUModelRunner` 的方法。它是 worker 的"对外编排接口"——负责把 runner 提供的 `_dummy_run`、`capture_model`、`warmup_kernels` 按正确顺序串起来。
 
-因此，V2 的 warmup 不能直接套用 V1 runner 中 `self.model_runner._dummy_run(size)` 的完整实现说明。
+### 6.2 为什么"热身"有三件不同的事
 
-> 讲解提示：warmup 为什么必须在 KV cache 分配**之后**？因为 warmup 的 dummy run 和 CUDA graph 捕获都要真的读写 KV cache，只有先分配好物理显存，才能让 kernel 以真实的形状和内存布局跑一遍，避免运行时首次触发 kernel 编译的"卡顿"。
+`compile_or_warm_up_model()` 里其实揉了三类性质不同的"热身"——这是读代码时最容易被绕晕的点：
+
+| 热身 | 解决什么问题 | 底层机制 |
+|---|---|---|
+| ① shape 级 dummy run（`_dummy_run(size)`） | 让模型按几种典型 token 数量先跑一遍，把编译结果固化下来 | torch.compile（VLLM_COMPILE 模式）按形状编译 |
+| ② CUDA Graph 捕获（`capture_model()`） | 把固定形状的一整串 kernel **录制**成图，重放时没有 Python 调度开销，decode 小 batch 延迟大降 | CUDA Graph capture + replay |
+| ③ kernel 调优 + Triton JIT（`kernel_warmup` / `warmup_kernels`） | 让 attention、Mamba、sampler 等**非 cudagraph 部分**完成 autotune 和首次编译 | Triton / 自定义 kernel autotune |
+
+背后是两个配置开关决定"走哪条路"：
+
+- `CompilationMode`（NONE / STOCK_TORCH_COMPILE / VLLM_COMPILE）：决定是否用 torch.compile 把模型图编译；
+- `cudagraph_mode`（NONE / PIECEWISE / FULL / FULL_AND_PIECEWISE）：决定是否捕获 CUDA Graph。`FULL_AND_PIECEWISE` = decode batch 用全图、prefill / mixed batch 用 piecewise 图，是性能最好的模式（多数配置下为默认）；
+- `--enforce-eager` 会把两者都设成 NONE——此时 warmup 只做 ①③。
+
+CUDA Graph 捕获有个硬性要求：**形状必须固定**。所以 vLLM 对一组预设的 batch 大小分别录制（默认 `[1, 2, 4] + 8,16,...,248 + ...`，上限 512 / 1024）。
+
+### 6.3 `GPUWorker.compile_or_warm_up_model` 四阶段流程
+
+按代码顺序拆解（`gpu_worker.py:693-872`）：
+
+**阶段 1：shape 级 dummy run（编译 warmup）**
+
+```python
+if self.vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE:
+    # 编译那些不在 cudagraph capture sizes 里、但用户仍希望编译的形状
+    warmup_sizes = compile_sizes 减去 cudagraph_capture_sizes
+    # 再补上每个 compile_range 的 end，保证每个区间至少编译过一次
+for size in sorted(warmup_sizes, reverse=True):
+    self.model_runner._dummy_run(size, skip_eplb=True, remove_lora=False)
+```
+
+`_dummy_run(size)`（`gpu/model_runner.py:633`）干的事：把 `size` 个 token 摊到若干假请求上，构造一个 `SchedulerOutput`，然后走一遍和真实推理**完全相同的 `execute_model`**。V2 这里还会连带 dummy run speculator（EAGLE / MTP）的 propose。
+
+**阶段 2：kernel 调优**
+
+```python
+kernel_warmup(self)
+```
+
+必须放在 capture 之前：调优选出的最快 kernel 配置，之后才会被"录进" CUDA Graph。
+
+**阶段 3：CUDA Graph 捕获**
+
+```python
+if not self.model_config.enforce_eager:
+    cuda_graph_memory_bytes = self.model_runner.capture_model()
+```
+
+`capture_model()`（`gpu/model_runner.py:848`）对每个 capture size 调用 `cudagraph_manager.capture(...)`，并测量实际占用显存。这个数值有两个用途：
+
+- 打印"CUDA graph 实际 vs 预估"对比日志；
+- 参与"建议 `--kv-cache-memory` 大小"的计算。
+
+**阶段 4（V2 专属）：Triton kernel 补漏**
+
+```python
+if self.use_v2_model_runner:
+    warmup_kernels(self.model_runner, self.execute_model, self.sample_tokens)
+```
+
+这是 V2 与 V1 最大的不同：它**手工构造真实调度器形状的 SchedulerOutput**（一次 N 请求 prefill → 多个 decode step → 清理），再走 `worker.execute_model` + `sample_tokens`，把 sampler、grammar bitmask、零化等**不在 cudagraph 里的 Triton kernel 全部 JIT 编译一遍**，同时 `kv_block_zeroer.warmup()` 预热零化 kernel。V1 在同样位置只做 sampler / pooler 的 dummy run。
+
+### 6.4 四个容易绕晕的点
+
+1. **"方法定义在 GPUWorker 而不是 V2 runner"**：`compile_or_warm_up_model` 属于 worker 的对外接口，它负责**编排**——调用 runner 的 `_dummy_run`、`capture_model`、`warmup_kernels`；runner 只提供能力。RPC 名 `"compile_or_warm_up_model"` 对应的是 worker 上的这个方法，不是 runner 的方法。
+2. **为什么必须在 KV cache 分配之后**：dummy run 是真实 forward，会**真的读写刚分配好的 KV cache**（block table、零化、attention 都要真实形状）；CUDA Graph 捕获更要录制完整执行流。KV cache 没分配，这一步根本跑不起来，而且捕获时的内存布局必须与运行时一致。
+3. **"受 compilation mode、cudagraph mode、capture sizes、speculative decoding、multimodal 影响"**：意思是**这几个配置决定"哪几条路径会被热身"**——mode=NONE 跳过阶段 1；cudagraph=NONE（如 enforce-eager）跳过阶段 3；有 spec decode 则连带 warmup drafter；multimodal 则 capture 时还要录 encoder 图。
+4. **"V2 不能直接套用 V1 的 `_dummy_run(size)` 说明"**：V1、V2 都有 `_dummy_run`，但 **V2 额外有 `warmup_kernels`，走的是真实调度路径**。讲解时应以 V2 的 `warmup_kernels` 为重点，而不是把 V1 的 `_dummy_run` 实现细节搬过来。
+
+> **核心要点**：四阶段的顺序是——**先 shape 编译，再 kernel 调优，再录 CUDA Graph，最后补漏 Triton kernel**。每一步都是让"运行时必然发生的首次编译"提前到服务开始之前。
 
 ---
 
 ## 七、运行时的新 block 清零
 
-KV Cache 是会被**复用**的：请求结束释放的 block，可能被下一个请求拿到。如果不清零，新请求会读到上一个请求残留的脏数据，污染 attention / SSM 计算。所以 vLLM 在"新 block 被用到之前"清零。
+> 这一节经常让人困惑：清零明明是"运行时"的事，为什么放在初始化章节？答案在 7.2 和 7.3——**"能力准备"在初始化，"执行"在运行时**，文档按初始化调用链组织，所以两件事在这一章一起讲。
 
-正式初始化时，`GPUWorker.initialize_from_config` 在 CuMem 池外调用 V2 runner 的 `_init_kv_zero_meta()`（`gpu/model_runner.py:621`），创建 `KVBlockZeroer` 并保存为 `self.kv_block_zeroer`。warmup 阶段（`gpu/warmup.py:292`）还会调用 `kv_block_zeroer.warmup(num_blocks)` 预构建按 `kernel_block_sizes` 与 `cache_dtype` 对齐的零化 bookkeeping tensor。
+### 7.1 为什么需要清零：block 是回收复用的
 
-推理过程中，scheduler 每步把新分配的 block id 放入 `SchedulerOutput.new_block_ids_to_zero` 下发。V2 runner 在 `update_requests()`（`gpu/model_runner.py:1036`）中消费：
+KV Cache 是会被**复用**的：请求结束释放的 block，可能被下一个请求拿到。如果不清零，新请求会读到上一个请求残留的脏数据，污染 attention / SSM 计算。
+
+但注意一个容易误解的点：**并非所有模型都需要零化**。`KVCacheConfig.needs_kv_cache_zeroing`（`kv_cache_interface.py:997`）只有在两种情况下才为 True：
+
+```python
+return self.has_mamba_layers or self.has_mixed_precision_kv_cache
+```
+
+- **有 Mamba 层**：Mamba 是循环状态机，状态在"读"的时候可能还没被"写"完，残留旧值会直接污染计算（见 #35219）；
+- **混合精度 KV cache**：一个 block 在不同 group 间复用，字节被"换一种精度"重新解释，旧数据可能被解码成 NaN / Inf。
+
+而最常见的**单一精度 full-attention 模型（Llama / Qwen 等）完全跳过零化**——因为 full attention 里，block 还没写到的位置**永远不会被读到**（attention mask 保证），残留脏数据无害。这也是为什么整套机制是"按需启用"的。
+
+### 7.2 为什么"能力准备"在初始化阶段
+
+`GPUWorker.initialize_from_config` 在 CuMem 池外调用 V2 runner 的 `_init_kv_zero_meta()`（`gpu/model_runner.py:621`），创建 `KVBlockZeroer` 并保存为 `self.kv_block_zeroer`。这一步**必须在初始化做**，因为它需要：
+
+- **已分配好的物理 KV tensor**：用来计算每个 block 段的绝对内存地址（`seg_addrs`）；
+- **block size / cache_dtype / kernel block size / attention groups**：这些只有 KV cache 分配完之后才知道。
+
+`KVBlockZeroer.__init__`（`vllm/v1/worker/utils.py:100`）会**预计算一张"地址表"**——每个 block id 对应它在显存里的绝对字节地址。这样运行时每步的零化只是一个按 block id 寻址的廉价 Triton kernel 发射，没有 Python 层遍历。warmup 阶段（`gpu/warmup.py:292`）还会调用 `kv_block_zeroer.warmup(num_blocks)` 先把零化 kernel JIT 编译好。
+
+### 7.3 为什么"执行"在运行时
+
+零化的**触发条件只有调度器每步才知道**：哪些 block 刚被分给新请求。所以流程分两步：
+
+1. **scheduler 侧**：每个 step 结束时 `take_new_block_ids()` 收集本轮新分配的 block id，写入 `SchedulerOutput.new_block_ids_to_zero` 下发（仅当 `needs_kv_cache_zeroing` 时才会记录这些 id）；
+2. **worker 侧**：V2 runner 在 `update_requests()`（`gpu/model_runner.py:1036`）里、**forward 之前**消费：
 
 ```python
 if scheduler_output.new_block_ids_to_zero:
@@ -667,9 +777,17 @@ if scheduler_output.new_block_ids_to_zero:
     self.kv_block_zeroer.zero_block_ids(scheduler_output.new_block_ids_to_zero)
 ```
 
-`KVBlockZeroer` 对物理 KV tensor 上对应 block 清零，避免复用的显存残留旧数据污染 attention/SSM 计算。它属于 V2 runner 的 `update_requests`（execute 前状态更新）路径，不涉及 V1 runner 的实现。
+`zero_block_ids` 用预计算的地址表 + Triton kernel 把对应 block 清零。
 
-> **核心要点**：清零不是"分配时一次做完"，而是**调度器在每步把新 block 的 id 报给 worker，worker 在 forward 之前清掉**。这样既不需要预清零全部显存（省时间），又能保证每次复用都安全。
+### 7.4 为什么不干脆在初始化时清零一次
+
+三个理由，层层递进：
+
+1. **清零了也白清**：block 是"回收再利用"的，脏数据来自"上一个主人"，是运行时才产生的——初始化时清零一次，服务过程中照样会变脏；
+2. **一次性清零整池太贵**：KV cache 动辄几十 GB，启动阶段清零纯属浪费时间；
+3. **按需清零又快又准**：只在"新 block 将被读到脏数据"的那一刻清它，而且 kernel 是按 block id 直接寻址的，每步开销极小。
+
+> **核心要点**：把这一章放在初始化叙事里的原因——**初始化阶段装好"机器"（`KVBlockZeroer` 的地址表 + kernel），运行时每个 step 用"机器"（按调度器下发的 block id 清零）**。前者是第七章（初始化链路的一步），后者在 9.5 节（运行时管理）。
 
 ---
 
