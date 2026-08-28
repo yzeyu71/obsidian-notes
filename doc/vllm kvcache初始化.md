@@ -278,16 +278,84 @@ def register_all_kvcache_specs(vllm_config):
 
 ### 3.2 收集 spec：`get_kv_cache_specs`
 
-`vllm/v1/executor/abstract.py`：
+完整调用链（层层下钻到 attention 层）：
+
+```text
+EngineCore._initialize_kv_caches()  → self.model_executor.get_kv_cache_specs()     # core.py:260
+  └─ Executor.get_kv_cache_specs()                                                   # abstract.py:151
+       └─ collective_rpc("get_kv_cache_spec")     # 每个 worker 各答一份
+            └─ GPUWorker.get_kv_cache_spec()                                        # gpu_worker.py:649
+                 └─ V2 GPUModelRunner.get_kv_cache_spec()                           # model_runner.py:490
+                      └─ attn_utils.get_kv_cache_spec(vllm_config)                  # attn_utils.py:61
+                           └─ 逐个 attention 层：attn_module.get_kv_cache_spec()    # attention.py:597
+```
+
+Executor 侧只是一个 RPC 转发：
 
 ```python
+# vllm/v1/executor/abstract.py:151
 def get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]:
     return self.collective_rpc("get_kv_cache_spec")
 ```
 
-V2 runner 的 `get_kv_cache_spec()`（`gpu/model_runner.py`）对 encoder-only 返回 `{}`，否则调用 `get_kv_cache_spec(self.vllm_config)`。每个 worker 返回 `{layer_name: KVCacheSpec}`。
+Worker 侧经过两层转发（worker → runner → attn_utils 模块函数）：
 
-> 讲解提示：为什么是"每 rank 一份 dict"？因为启用了 pipeline parallel 时，不同 stage 上分布着不同层的模型，层名各不相同。这份 dict 就是各 worker 对"我这里有哪些层、各是什么类型"的自报家门。
+```python
+# gpu_worker.py:649
+def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
+    return self.model_runner.get_kv_cache_spec()
+
+# gpu/model_runner.py:490 —— V2 runner
+def get_kv_cache_spec(self):
+    if self.is_encoder_only:
+        return {}                          # 纯编码器模型：没有自回归 KV cache
+    return get_kv_cache_spec(self.vllm_config)   # ← attn_utils.py 的模块函数
+```
+
+**真正落到 attention 层的是 `attn_utils.get_kv_cache_spec`（`attn_utils.py:61`）：**
+
+```python
+def get_kv_cache_spec(vllm_config) -> dict[str, KVCacheSpec]:
+    kv_cache_spec = {}
+    attn_layers = get_layers_from_vllm_config(vllm_config, AttentionLayerBase)
+    for layer_name, attn_module in attn_layers.items():
+        if getattr(attn_module, "kv_sharing_target_layer_name", None):
+            continue                       # KV 共享层：直接用目标层的 cache，不分配
+        if spec := attn_module.get_kv_cache_spec(vllm_config):
+            if isinstance(spec, AttentionSpec):
+                backend = attn_module.get_attn_backend()
+                spec = replace(spec, indexes_kv_by_block_stride=backend.indexes_kv_by_block_stride())
+                spec = backend.customize_spec(spec)   # 按 backend 定制（页对齐等）
+            kv_cache_spec[layer_name] = spec
+    return kv_cache_spec
+```
+
+这里有三层过滤 / 定制：
+
+1. **KV 共享层跳过**：某些层不存自己的 KV，而是复用"共享目标层"的 cache（`kv_sharing_target_layer_name`），不为它分配内存；
+2. **无 cache 层返回 None**：`attn_module.get_kv_cache_spec()` 返回 `None` 时（如 encoder-only attention）不进入结果；
+3. **backend 定制**：AttentionSpec 会用该层所选 attention backend 的 `indexes_kv_by_block_stride()` 与 `customize_spec()` 补上"按 block stride 索引"、页对齐等 backend 相关属性。
+
+**每个 attention 层"自报家门"**（`attention.py:597`，标准 Attention 层）：
+
+```python
+def get_kv_cache_spec(self, vllm_config) -> KVCacheSpec | None:
+    if self.attn_type in (ENCODER_ONLY, ENCODER):
+        return None                       # 编码器 attention：prefill-only，无自回归 cache
+    quant_mode = get_kv_quant_mode(self.kv_cache_dtype)
+    if self.sliding_window is not None:
+        return SlidingWindowSpec(block_size=..., num_kv_heads=self.num_kv_heads,
+                                 head_size=self.head_size, dtype=self.kv_cache_torch_dtype,
+                                 kv_quant_mode=quant_mode, sliding_window=self.sliding_window)
+    else:
+        return FullAttentionSpec(block_size=..., num_kv_heads=self.num_kv_heads,
+                                 head_size=self.head_size, dtype=self.kv_cache_torch_dtype,
+                                 kv_quant_mode=quant_mode)
+```
+
+spec 里的字段全部来自层自己的配置：`num_kv_heads`、`head_size`、`kv_cache_torch_dtype`、`kv_quant_mode`、`sliding_window`、`block_size`。层名来自 `get_layers_from_vllm_config`——它读的是模型构建时所有层注册进 `static_forward_context` 的注册表（`vllm.py:2674`），按 `AttentionLayerBase` 类型过滤。
+
+> 讲解提示：为什么是"每 rank 一份 dict"？因为启用了 pipeline parallel 时，不同 stage 上分布着不同层的模型，层名各不相同。这份 dict 就是各 worker 对"我这里有哪些层、各是什么类型"的自报家门。而"自报家门"的设计本质是**每层自己最清楚自己需要什么**（类型、hidden size、窗口大小），EngineCore 只需要汇总，不需要重复推断。
 
 ### 3.3 non-causal 修正：双向注意力不能用前缀缓存
 
@@ -432,6 +500,39 @@ def get_kv_cache_configs(vllm_config, kv_cache_specs, available_memory):
 >
 > 结果：所有 rank 一致地拥有 16384 个逻辑 block，调度器无需关心 rank 差异。
 > ```
+
+> **再举个复杂例子：混合模型（full attention + sliding window），PP=2、TP=2**
+>
+> 模型共 12 层：层 0-3 是 full attention（`full.0~full.3`），层 4-11 是 sliding window（`sw.0~sw.7`，窗口 4096）。PP=2，每个 stage 6 层。这属于 3.5.1 的"其它"分支（先按 page size 统一、再分组）。
+>
+> ```text
+> worker0（stage0，层 0-5）：full.0, full.1, sw.0, sw.1, sw.2, sw.3
+> worker1（stage1，层 6-11）：full.2, full.3, sw.4, sw.5, sw.6, sw.7
+> ```
+>
+> ```text
+> (a) 合并 → 12 层 spec：4 个 full-attention + 8 个 sliding-window
+> (d) 全局分组（按 spec 类型，不是按 page size）：
+>       G_full = [full.0-3]（FullAttentionSpec）
+>       G_sw   = [sw.0-7]（SlidingWindowSpec）
+>       ⚠️ 两者 page size 相同也仍是两组——分组依据是"管理器 / 回收语义"，不是页大小
+> (e) 投影：
+>       worker0 → G_full=[full.0-1]，G_sw=[sw.0-3]
+>       worker1 → G_full=[full.2-3]，G_sw=[sw.4-7]
+> (i) 布局（通用多 group 分支；设 unify 后 page_size = 1 MiB，group_size = max(2,4) = 4）：
+>       worker0（可用 8 GiB）：num_blocks = 8 GiB ÷ 1 MiB ÷ 4 = 2048
+>         pool0 = full.0 + sw.0      pool1 = full.1 + sw.1     （各 2 GiB）
+>         pool2 = sw.2               pool3 = sw.3              （各 2 GiB）
+>       worker1（可用 10 GiB）：num_blocks = 10 GiB ÷ 1 MiB ÷ 4 = 2560
+>         pool0 = full.2 + sw.4      pool1 = full.3 + sw.5     （各 2.5 GiB）
+>         pool2 = sw.6               pool3 = sw.7              （各 2.5 GiB）
+> (j) 取最小 → 两个 worker 都收敛到 2048，worker1 的每个 pool 缩到 2 GiB，剩余 2 GiB 闲置
+> ```
+>
+> 这个例子额外展示了三点：
+> 1. **分组按 spec 类型、不按 page size**——full 与 sw 页大小相同仍分两组（管理器与回收语义不同）；
+> 2. **PP 投影让两个 worker 持有不同层组合**，各自算出不同的 pool 共享关系（worker0 的 pool0 是 `full.0+sw.0`，worker1 的 pool0 是 `full.2+sw.4`）；
+> 3. **(j) 步把显存不均衡的 worker1 拉到与 worker0 一致**，多出的 2 GiB 暂时闲置——这就是"取最小块数、按比例缩 tensor"的代价与意义。
 
 关键点：合并 spec → 分组 → 按 PP 投影 → auto-fit / 校验 → 每 rank 独立建配置 → 收敛到最小 `num_blocks`，保证所有 worker 一致。
 
